@@ -1,0 +1,8 @@
+# 统一换行符，避免 Windows 上检出时 .go 文件变 CRLF
+* text=auto eol=lf
+
+# 构建产物与模板按二进制处理，不要参与 diff / 换行转换
+*.dll binary
+*.so binary
+*.dylib binary
+*.json text eol=lf

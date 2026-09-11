@@ -1,0 +1,22 @@
+# 编译产物
+*.so
+*.dylib
+*.dll
+*.h
+
+# 凭据 —— CPA 导出的文件名是 <provider>-<账号>.json，含 access/refresh token，切勿提交
+qoder-*.json
+cline-*.json
+workbuddy-*.json
+qoder.json
+cline.json
+workbuddy.json
+
+# Go
+/vendor/
+
+# 本地编辑器/系统
+.DS_Store
+*.swp
+.idea/
+.vscode/
