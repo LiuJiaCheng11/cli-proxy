@@ -1252,6 +1252,15 @@ func firstNonEmpty(vals ...string) string {
 
 func stripDataPrefix(s string) string {
 	s = strings.TrimSpace(s)
+	// SSE comment line (e.g. a ": heartbeat" keep-alive). Per the SSE spec a
+	// line starting with ':' carries no event data; returning "" makes every
+	// caller drop it via its existing empty-content check. The domestic
+	// upstream does not currently send heartbeats, but the international one
+	// does, and an unguarded comment leaks downstream as a chunk that clients
+	// reject with `Unexpected token ':', ": heartbeat" is not valid JSON`.
+	if strings.HasPrefix(s, ":") {
+		return ""
+	}
 	for strings.HasPrefix(s, "data:") {
 		s = strings.TrimSpace(strings.TrimPrefix(s, "data:"))
 	}

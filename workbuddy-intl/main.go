@@ -63,6 +63,8 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -82,7 +84,14 @@ const (
 	providerName  = "workbuddy-intl"
 	authFileName  = "workbuddy-intl.json"
 	upstreamBase  = "https://www.workbuddy.ai"
-	clientUA      = "workbuddy-ai/2.63.2 WorkBuddy/2.63.2"
+	// Outbound client identity, aligned with the official 5.8.4 desktop build.
+	// Upstream runs a *sampled* channel verification on the chat endpoint: when
+	// it samples a request, it demands the conversation header family (see
+	// conversationHeaders) and rejects anything that looks like a non-official
+	// client with 400 / code 11128 "conversation id missing". Version and UA are
+	// part of that fingerprint, so they must track the real client.
+	clientUA      = "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"
+	clientVersion = "5.8.4"
 	originReferer = "https://www.workbuddy.ai"
 
 	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=workbuddy-ai"
@@ -519,12 +528,68 @@ func commonHeaders(req *http.Request) {
 	req.Header.Set("Origin", originReferer)
 	req.Header.Set("Referer", originReferer+"/")
 	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("X-IDE-Version", clientVersion)
+}
+
+// newHexID returns 32 lowercase hex chars, the shape the official client uses
+// for X-Request-ID and the request/message trace ids.
+func newHexID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand is effectively infallible here; fall back to time so a
+		// transient failure still yields a well-formed, unique-enough id.
+		n := uint64(time.Now().UnixNano())
+		for i := 0; i < 8; i++ {
+			b[i] = byte(n >> (8 * i))
+		}
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// newUUID returns a dashed (8-4-4-4-12) UUIDv4, matching the conversation id
+// shape captured from the official 5.8.4 desktop client.
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		n := uint64(time.Now().UnixNano())
+		for i := 0; i < 8; i++ {
+			b[i] = byte(n >> (8 * i))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	h := hex.EncodeToString(b[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// applyConversationHeaders adds the conversation header family that upstream's
+// sampled channel verification requires on /v2/chat/completions.
+//
+// Without it a sampled request is rejected with 400 / code 11128
+// ("conversation id missing", displayTips: "this call failed channel
+// verification, possibly not sent from an official client"). Before this was
+// added the plugin sent none of these, so every sampled request failed — which
+// is why the error only showed up intermittently and, once an account's traffic
+// started getting sampled, appeared to fail "for that account only".
+//
+// Shape follows the 5.8.4 capture: the conversation id is a dashed UUID that is
+// *fresh per call* (upstream keeps no server-side history keyed by it), while
+// the request / conversation-request / root-request / message ids are one and
+// the same 32-hex value.
+func applyConversationHeaders(req *http.Request) {
+	reqID := newHexID()
+	req.Header.Set("X-Request-ID", reqID)
+	req.Header.Set("X-Conversation-ID", newUUID())
+	req.Header.Set("X-Conversation-Request-ID", reqID)
+	req.Header.Set("X-Root-Request-ID", reqID)
+	req.Header.Set("X-Conversation-Message-ID", reqID)
 }
 
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 func backendHeaders(req *http.Request, sa *storedAuth) {
 	commonHeaders(req)
+	applyConversationHeaders(req)
 	if sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
 	} else {
@@ -1321,6 +1386,15 @@ func firstNonEmpty(vals ...string) string {
 
 func stripDataPrefix(s string) string {
 	s = strings.TrimSpace(s)
+	// SSE comment line (e.g. the upstream's leading ": heartbeat" keep-alive).
+	// Per the SSE spec a line starting with ':' is a comment and carries no
+	// event data; returning "" makes every caller drop it via its existing
+	// empty-content check. Without this the heartbeat leaked downstream as a
+	// chunk and clients tripped on `Unexpected token ':', ": heartbeat" is not
+	// valid JSON`.
+	if strings.HasPrefix(s, ":") {
+		return ""
+	}
 	for strings.HasPrefix(s, "data:") {
 		s = strings.TrimSpace(strings.TrimPrefix(s, "data:"))
 	}
