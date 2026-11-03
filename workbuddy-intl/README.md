@@ -60,6 +60,26 @@ plugins:
 
 重启 CPA，日志出现 `plugin loaded ... plugin_id=workbuddy-intl` 即成功。然后到 CPA 面板添加 workbuddy-intl 凭据，扫码登录 WorkBuddy。
 
+## 排错
+
+### 提示「当前无可用凭据」（`auth_not_found`）
+
+```
+auth_not_found: no auth available (providers=workbuddy-intl, model=deepseek-v4.1-flash-sg)
+```
+
+问题**不在插件**：`auth_not_found` 是 CPA 路由层给出的答案，请求根本没到插件，说明 `~/.cli-proxy-api/workbuddy-intl-*.json` 里没有 `disabled` 为 `false` 的条目。最常见来源是 CPA 因上游 400 把账号拉黑了，或手工禁用后没开回来。
+
+把那个 JSON 的 `"disabled"` 改成 `false` 存盘即可，CPA 有文件监听，日志出现 `auth file changed (WRITE)` 就生效，不用重启。想确认 token 本身还有没有效，绕过 CPA 直接打上游最快。
+
+### 提示「模型不可用」（`11158`）
+
+```
+{"code":11158,"msg":"model [grok-4.7] is not allowed for user type [personal_free_user]"}
+```
+
+这是**账号档位限制**，不是插件问题：免费账号不支持该模型，插件层绕不过去。换目录里账号能用的模型即可（以 `GET /v1/models` 的实际返回为准）。别名（`primary-model` / `default-model` 等）由网关解析成具体模型，如果解析结果属于付费档，同样会报这个码。
+
 ## 使用
 
 CPA 默认端口 `8317`，API key 见 `config.yaml` 的 `api-keys`。

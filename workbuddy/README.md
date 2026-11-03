@@ -39,6 +39,22 @@ plugins:
 
 重启 CPA,日志出现 `plugin loaded ... plugin_id=workbuddy` 即成功,`GET /v1/models` 也能看到上面的模型。然后到 CPA 面板添加 workbuddy 凭据,扫码登录 CodeBuddy。
 
+## 排错:提示"当前无可用凭据"
+
+如果客户端报下面这句,问题**不在插件**,而在凭据本身:
+
+```
+auth_not_found: no auth available (providers=workbuddy, model=deepseek-v4.1-flash)
+```
+
+`auth_not_found` 是 CPA 路由层给出的答案,意味着请求根本没到插件——`~/.cli-proxy-api/workbuddy-*.json` 里没有 `disabled` 为 `false` 的条目。最常见的原因是 CPA 因为上游 400 把这个账号拉黑了(日志里会有 `auth_unavailable ... last upstream error`),或手工禁用后没开回来。
+
+处置:把那个 JSON 的 `"disabled"` 改成 `false` 存盘。CPA 有文件监听,日志出现 `auth file changed (WRITE)` 就是生效了,不用重启。
+
+想确认 token 本身还有没有效,绕过 CPA 直接打上游最快——有 200 就说明纯粹是 CPA 侧没启用。
+
+一个账号被拉黑会连坐它下面的**所有**模型,症状看起来像"整个 provider 挂了"。
+
 ## 使用
 
 CPA 默认端口 `8317`,API key 见 `config.yaml` 的 `api-keys`。

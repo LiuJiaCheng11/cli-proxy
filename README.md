@@ -161,6 +161,32 @@ CPA 默认端口 `8317`，API key 在 `config.yaml` 的 `api-keys`。
 
 同一个 provider 可以加多个账号，CPA 自己会在它们之间调度。界面上靠账号名区分——插件会把账号身份写进 `Metadata["email"]`（列表显示）和 `FileName`（`qoder-<账号>.json`，详情显示）。
 
+## 排错：客户端说"用不了"，但插件日志里什么都没有
+
+先看 CPA 的错误信息属于哪一层，三层的处置完全不同：
+
+| 错误 | 谁拒绝的 | 处置 |
+|---|---|---|
+| `auth_not_found: no auth available (providers=workbuddy, model=…)` | CPA 路由层，**请求没到插件** | 该 provider 下没有可用凭据，见下 |
+| `auth_unavailable: … last upstream error: upstream 400 {"code":11133"…}` | CPA 收到上游 400 后把凭据拉黑了 | 先修请求（本仓库已处理 11133），再重新启用账号 |
+| `upstream 400: {"code":11128…}` | 上游渠道校验 | 见各 provider README 的「渠道校验」 |
+
+`auth_not_found` 是最容易被误判成"插件坏了"的一种：**它意味着插件根本没被调用**。凭据 JSON 里的 `"disabled": true` 就会造成这个结果——常见来源是 CPA 因为上游 400 自动拉黑，或手工禁用后忘了开回来。
+
+排查顺序：
+
+```bash
+# 1. 看凭据是不是被禁用了（disabled 为 true 就是它）
+jq '.disabled' ~/.cli-proxy-api/workbuddy-*.json
+
+# 2. 绕过 CPA 直接打上游，确认 token 本身还有效
+#    （有 200 就说明账号没问题，纯粹是 CPA 侧没启用）
+
+# 3. 启用后 CPA 会热加载，日志里有 auth file changed (WRITE) 即可，不必重启
+```
+
+一个账号被拉黑会连坐它下面的**所有**模型，症状看起来像"整个 provider 挂了"，实际只是那一个 JSON 的 `disabled` 字段。
+
 ## 目录结构
 
 ```
