@@ -391,11 +391,78 @@ func PrepareBody(payload []byte) []byte {
 		ensureSystemHead(obj, messages)
 	}
 	normalizeToolChoice(obj)
+	dropRefusedReasoning(obj)
 	out, ok := marshalBody(obj)
 	if !ok {
 		return payload
 	}
 	return out
+}
+
+// refusesOff lists the model ids measured to answer HTTP 400 / code 11133 to
+// `reasoning_effort: "off"` — "the request parameters were rejected by the
+// model provider" — even though their catalog entry declares
+// `canDisableThinking: true`.
+//
+// WHY THIS IS A HARD LIST AND NOT A CAPABILITY CHECK. The upstream's own
+// declaration is what lies here, so believing it is exactly the bug. The cost is
+// also asymmetric: offering a level that always fails costs EVERY request for
+// that model, while hiding one that would have worked costs a single option.
+//
+// WHY IT MATTERS BEYOND ONE FAILED REQUEST. Measured 2026-11-03 on
+// www.workbuddy.ai with a real token: `off` answers 400 / 11133 while low,
+// medium, high, xhigh, max, minimal and none all answer 200 — so the refusal is
+// specific to `off`, not to the parameter. CPA reacts to that 400 by benching
+// the credential ("auth_unavailable ... last upstream error: upstream 400
+// {"code":11133"..."), which turns one bad option into every model on that
+// account failing. That is why this must be stripped BEFORE the request leaves,
+// not retried after it fails.
+//
+// Keyed by exact model id and deliberately not by region: the split tracks the
+// model family, not the gateway. Aliases (`primary-model`, `default-model`) are
+// resolved by the gateway, so the ids that actually travel are what is listed;
+// ids added upstream later are covered by dropRefusedReasoning's own guard only
+// as far as they appear here, and the ladder in the plugin main packages covers
+// the rest by making the body different on the next attempt.
+var refusesOff = map[string]bool{
+	"deepseek-v4.1-flash":    true,
+	"deepseek-v4.1-flash-sg": true,
+	"deepseek-v4-pro":        true,
+	"primary-model":          true,
+	"gpt-6-astra":            true,
+	"gpt-5.6-sol":            true,
+	"gpt-5.6-terra":          true,
+	"gpt-5.6-luna":           true,
+	"gpt-6-luna":             true,
+	"gemini-3.5-flash":       true,
+}
+
+// RefusesOff reports whether a model is known to reject `reasoning_effort: off`.
+func RefusesOff(modelID string) bool {
+	return refusesOff[strings.TrimSpace(modelID)]
+}
+
+// dropRefusedReasoning deletes `reasoning_effort: "off"` when the model is known
+// to reject it.
+//
+// Stripped HERE because this is the last place the plugin controls the body
+// before the upstream counts it, and because the test is the same table the
+// caller can read — so the two cannot drift apart.
+//
+// Only the literal `off` is touched. Every other effort value answered 200 on
+// every model measured, and a body naming no effort is left alone: deleting a
+// field the caller never sent would be inventing an opinion about how the model
+// should think.
+func dropRefusedReasoning(obj map[string]any) {
+	effort, ok := obj["reasoning_effort"].(string)
+	if !ok || !strings.EqualFold(strings.TrimSpace(effort), "off") {
+		return
+	}
+	model, _ := obj["model"].(string)
+	if !RefusesOff(model) {
+		return
+	}
+	delete(obj, "reasoning_effort")
 }
 
 // ensureSystemHead puts a system message in front of a conversation that has

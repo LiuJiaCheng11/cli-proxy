@@ -238,3 +238,64 @@ func TestIsChannelReject(t *testing.T) {
 		}
 	}
 }
+
+// The upstream declares canDisableThinking:true on models that then answer
+// 400 / 11133 to `off`. Measured 2026-11-03: every other level (low, medium,
+// high, xhigh, max, minimal, none) answers 200, so the refusal is specific to
+// `off`. CPA benches the credential on that 400, which is why it must be
+// stripped before the request leaves rather than retried after it fails.
+func TestPrepareBodyDropsRefusedOff(t *testing.T) {
+	for _, model := range []string{"deepseek-v4.1-flash-sg", "deepseek-v4.1-flash", "gpt-5.6-terra"} {
+		payload := body(t, map[string]any{
+			"model":            model,
+			"reasoning_effort": "off",
+			"messages":         []any{map[string]any{"role": "system", "content": "hi"}},
+		})
+		out := channelgate.PrepareBody(payload)
+		var obj map[string]any
+		if err := json.Unmarshal(out, &obj); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, still := obj["reasoning_effort"]; still {
+			t.Errorf("%s: reasoning_effort off was not dropped", model)
+		}
+	}
+}
+
+// Every other level is accepted, so stripping them would silently change how
+// the model thinks on a request the upstream answers today.
+func TestPrepareBodyKeepsAcceptedEfforts(t *testing.T) {
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max", "minimal", "none"} {
+		payload := body(t, map[string]any{
+			"model":            "deepseek-v4.1-flash-sg",
+			"reasoning_effort": effort,
+			"messages":         []any{map[string]any{"role": "system", "content": "hi"}},
+		})
+		out := channelgate.PrepareBody(payload)
+		var obj map[string]any
+		if err := json.Unmarshal(out, &obj); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got, _ := obj["reasoning_effort"].(string); got != effort {
+			t.Errorf("effort %q was altered to %q", effort, got)
+		}
+	}
+}
+
+// A model NOT on the refusal list keeps its `off`: the table errs towards
+// hiding, but it must not over-hide.
+func TestPrepareBodyKeepsOffForAcceptingModel(t *testing.T) {
+	payload := body(t, map[string]any{
+		"model":            "kimi-k3",
+		"reasoning_effort": "off",
+		"messages":         []any{map[string]any{"role": "system", "content": "hi"}},
+	})
+	out := channelgate.PrepareBody(payload)
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, _ := obj["reasoning_effort"].(string); got != "off" {
+		t.Errorf("kimi-k3 accepts off, but it was %q", got)
+	}
+}
