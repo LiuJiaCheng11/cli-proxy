@@ -71,6 +71,8 @@ import (
 	"unicode"
 	"unsafe"
 
+	"github.com/LiuJiaCheng11/cli-proxy/internal/channelgate"
+	"github.com/LiuJiaCheng11/cli-proxy/internal/wire"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -507,10 +509,29 @@ func commonHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", clientUA)
 }
 
+// identityOf describes the outbound client this credential should present.
+func identityOf(sa *storedAuth) wire.Identity {
+	return wire.Identity{
+		Region:     wire.RegionCN,
+		UID:        sa.Account.UID,
+		AppVersion: "5.8.3",
+	}
+}
+
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
+//
+// The attribution and device headers exist because an official client describes
+// ITSELF the same way on every request; a proxy that says `X-Product: SaaS` in
+// one header and nothing at all in the rest is the cheapest shape for a static
+// rule to pick out. Measured 2026-11-02: the domestic gateway answers 200 either
+// way for a body it already accepts, so this is hardening, not a gate.
 func backendHeaders(req *http.Request, sa *storedAuth) {
 	commonHeaders(req)
+	identity := identityOf(sa)
+	wire.ApplyAttributionHeaders(req, identity)
+	wire.ApplyDeviceHeaders(req, identity)
+	wire.ApplyConversationHeaders(req)
 	if sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
 	} else {
@@ -534,7 +555,6 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
-	req.Header.Set("X-Product", "SaaS")
 }
 
 // doJSON sends method to fullURL with the given headers, parses the {code,msg,data}
@@ -806,6 +826,130 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 // Executor handlers
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Request preparation and the channel-gate retry ladder
+// -----------------------------------------------------------------------------
+
+// prepareBody turns the host's payload into the shape the gateway accepts and
+// neutralises the content fingerprints it refuses.
+//
+// The order is load-bearing. PrepareBody fixes the STRUCTURE (stream flag,
+// developer role, system head, tool_choice) — a request with the wrong shape is
+// refused before its content is ever read. RewritePhrasesInBody then applies the
+// measured phrase table, which is the fix for a real DeepSeek Harness prompt:
+// measured 2026-11-02 on copilot.tencent.com, the same body with every other
+// field held fixed answers 400 / 11128 until the WHOLE table is applied — the
+// three identity sentences alone, the @-path paragraph alone, a neutral head
+// alone and a zero-width perturbation alone all still answer 400.
+func prepareBody(payload, original []byte) []byte {
+	src := payload
+	if len(src) == 0 {
+		src = original
+	}
+	prepared := channelgate.PrepareBody(src)
+	rewritten, _ := channelgate.RewritePhrasesInBody(prepared)
+	return applyModelTweaks(rewritten)
+}
+
+// gateRung is one rescue step for a request the gateway refused with 11128
+// after the phrase table had already been applied.
+type gateRung struct {
+	label string
+	apply func([]byte) ([]byte, bool)
+}
+
+// gateLadder is the rescue ladder. It does NOT guess the offending span — it
+// makes the request structurally different instead, in increasing order of cost:
+//
+//  1. force a neutral head in front of every scanned message;
+//  2. insert zero-width breaks at sentence/clause/proper-name boundaries;
+//  3. the same, between every pair of word runes (the dense form).
+//
+// Each rung is only spent if the previous one was refused, because rung 3 grows
+// a 10.8k-character prompt by ~70%.
+func gateLadder() []gateRung {
+	return []gateRung{
+		{"neutral head", channelgate.NeutralizeFingerprints},
+		{"sparse zero-width", func(b []byte) ([]byte, bool) { return channelgate.PerturbFingerprints(b, false) }},
+		{"dense zero-width", func(b []byte) ([]byte, bool) { return channelgate.PerturbFingerprints(b, true) }},
+	}
+}
+
+// chatResult is one upstream answer: either a live 2xx response (the caller owns
+// the body) or the failure status and body text.
+type chatResult struct {
+	resp   *http.Response
+	status int
+	body   []byte
+	// tried lists the rescue rungs that were spent before giving up, so a
+	// refusal that survives the whole ladder can be told apart from one that was
+	// never retried.
+	tried []string
+}
+
+// describe renders a failure for the client. The ladder history is appended
+// because "upstream 400: 11128" alone cannot distinguish a request that was
+// retried three times from one that was not retried at all.
+func (r chatResult) describe() string {
+	message := fmt.Sprintf("upstream %d: %s", r.status, truncate(string(r.body), 400))
+	if len(r.tried) > 0 {
+		message += fmt.Sprintf(" [channel-gate ladder exhausted: %s]", strings.Join(r.tried, " -> "))
+	}
+	return message
+}
+
+// postChat sends one chat request and returns the raw answer without consuming
+// the body of a successful response.
+func postChat(body []byte, sa *storedAuth) (chatResult, error) {
+	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	if err != nil {
+		return chatResult{}, err
+	}
+	backendHeaders(httpReq, sa)
+	resp, err := sharedHTTPClient().Do(httpReq)
+	if err != nil {
+		return chatResult{}, fmt.Errorf("http_error: %w", err)
+	}
+	if resp.StatusCode < 400 {
+		return chatResult{resp: resp, status: resp.StatusCode}, nil
+	}
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
+	return chatResult{status: resp.StatusCode, body: payload}, nil
+}
+
+// openChatStream posts a prepared body and walks the rescue ladder while the
+// gateway keeps answering 11128. On success it returns a live response whose
+// body the caller must close; otherwise it returns the last failure.
+func openChatStream(body []byte, sa *storedAuth) (chatResult, error) {
+	result, err := postChat(body, sa)
+	if err != nil {
+		return result, err
+	}
+	if result.resp != nil || !channelgate.IsChannelReject(result.body) {
+		return result, nil
+	}
+	current := body
+	var tried []string
+	for _, rung := range gateLadder() {
+		next, changed := rung.apply(current)
+		if !changed {
+			continue
+		}
+		current = next
+		tried = append(tried, rung.label)
+		result, err = postChat(current, sa)
+		if err != nil {
+			return result, err
+		}
+		if result.resp != nil || !channelgate.IsChannelReject(result.body) {
+			return result, nil
+		}
+	}
+	result.tried = tried
+	return result, nil
+}
+
 func handleExecExecute(raw []byte) ([]byte, error) {
 	var req pluginapi.ExecutorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -817,22 +961,16 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	}
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
-	body := rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest))
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	body := prepareBody(req.Payload, req.OriginalRequest)
+	result, err := openChatStream(body, sa)
 	if err != nil {
 		return nil, err
 	}
-	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http_error: %w", err)
+	if result.resp == nil {
+		return nil, fmt.Errorf("%s", result.describe())
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		payload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(payload), 200))
-	}
-	completion, err := aggregateCompletion(resp.Body, req.Model)
+	defer result.resp.Body.Close()
+	completion, err := aggregateCompletion(result.resp.Body, req.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -856,34 +994,43 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	body := req.Payload
-	if len(body) == 0 {
-		body = req.OriginalRequest
-	}
-	body = rewriteSystemForUpstream(body)
+	body := prepareBody(req.Payload, req.OriginalRequest)
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
 
-	// No async stream id → fall back to synchronous chunk collection.
-	if req.StreamID == "" {
-		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
-		if errCollect != nil {
-			return nil, errCollect
-		}
-		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
-	}
-
-	// Async: return immediately with empty chunks. A goroutine pumps the upstream
-	// and emits each chunk via host.stream.emit so the client sees true streaming.
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	// The FIRST attempt is deliberately synchronous: the channel gate answers
+	// 400 with a body, and a retry cannot be decided after the client has
+	// already been handed a stream id.
+	result, err := openChatStream(body, sa)
 	if err != nil {
+		if req.StreamID == "" {
+			return nil, err
+		}
 		streamEmitError(req.StreamID, err.Error())
 		streamClose(req.StreamID)
 		return okEnvelope(streamResponse{Headers: headers})
 	}
-	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+	if result.resp == nil {
+		message := result.describe()
+		if req.StreamID == "" {
+			return nil, fmt.Errorf("%s", message)
+		}
+		streamEmitError(req.StreamID, message)
+		streamClose(req.StreamID)
+		return okEnvelope(streamResponse{Headers: headers})
+	}
+
+	// No async stream id → drain the response and return the chunks inline.
+	if req.StreamID == "" {
+		defer result.resp.Body.Close()
+		return okEnvelope(streamResponse{Headers: headers, Chunks: aggregateSSE(result.resp.Body, sseFramed)})
+	}
+
+	// Async: return immediately with empty chunks. A goroutine reads the already
+	// open response and emits each chunk via host.stream.emit so the client sees
+	// true streaming.
+	go pumpUpstreamStream(result.resp, req.StreamID, sseFramed)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -895,24 +1042,12 @@ func streamHeaders() http.Header {
 	return h
 }
 
-// pumpUpstreamStream reads the upstream SSE response in the background and
-// emits each cleaned chunk to the host stream. It closes the stream when done.
-// An emit failure (client disconnected → host closed the stream) aborts the
-// pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
-	resp, err := sharedHTTPClient().Do(httpReq)
-	if err != nil {
-		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-		streamClose(streamID)
-		return
-	}
+// pumpUpstreamStream reads an already-open upstream SSE response in the
+// background and emits each cleaned chunk to the host stream. It closes the
+// stream when done. An emit failure (client disconnected → host closed the
+// stream) aborts the pump so we stop reading a dead upstream.
+func pumpUpstreamStream(resp *http.Response, streamID string, sseFramed bool) {
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
-		streamClose(streamID)
-		return
-	}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -1040,32 +1175,11 @@ func isEmptyValue(v any) bool {
 	return false
 }
 
-// forceStreamBody returns the request body with "stream":true set, since the
-// upstream rejects non-streaming chat requests.
-func forceStreamBody(payload, original []byte) []byte {
-	src := payload
-	if len(src) == 0 {
-		src = original
-	}
-	var obj map[string]any
-	if json.Unmarshal(src, &obj) != nil {
-		return src
-	}
-	obj["stream"] = true
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return src
-	}
-	return out
-}
-
-// rewriteSystemForUpstream neutralizes Claude Code template phrases that
-// Tencent CodeBuddy's content filter blocklists verbatim — the agent identity
-// line ("You are Claude Code, Anthropic's official CLI for Claude.") and the
-// git injection ("Main branch (you will usually use this for PRs)"). Each
-// rewrite is a single-word change so the prompt's meaning is preserved while
-// dodging the exact-match filter.
-func rewriteSystemForUpstream(payload []byte) []byte {
+// applyModelTweaks pins reasoning_effort to "high" for Hunyuan-family models.
+//
+// Kept out of channelgate on purpose: this is a MODEL preference, not a gateway
+// rule, and the two must be able to change independently.
+func applyModelTweaks(payload []byte) []byte {
 	if len(payload) == 0 {
 		return payload
 	}
@@ -1073,21 +1187,7 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 	if json.Unmarshal(payload, &obj) != nil {
 		return payload
 	}
-	messages, _ := obj["messages"].([]any)
-	changed := false
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		if rewriteContentField(msg) {
-			changed = true
-		}
-	}
-	if forceMaxThinking(obj) {
-		changed = true
-	}
-	if !changed {
+	if !forceMaxThinking(obj) {
 		return payload
 	}
 	out, err := json.Marshal(obj)
@@ -1095,45 +1195,6 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 		return payload
 	}
 	return out
-}
-
-// rewriteContentField sanitizes blocked templates in one message's content,
-// handling both plain-string and OpenAI multimodal (array of parts) shapes.
-// Returns true if the message was modified.
-func rewriteContentField(msg map[string]any) bool {
-	switch c := msg["content"].(type) {
-	case string:
-		if r := sanitizeBlockedTemplates(c); r != c {
-			msg["content"] = r
-			return true
-		}
-	case []any:
-		modified := false
-		for _, p := range c {
-			part, ok := p.(map[string]any)
-			if !ok {
-				continue
-			}
-			if t, ok := part["text"].(string); ok {
-				if r := sanitizeBlockedTemplates(t); r != t {
-					part["text"] = r
-					modified = true
-				}
-			}
-		}
-		return modified
-	}
-	return false
-}
-
-func sanitizeBlockedTemplates(s string) string {
-	s = strings.ReplaceAll(s,
-		"You are Claude Code, Anthropic's official CLI for Claude.",
-		"You are Claude Code, Anthropic's official CLI tool for Claude.")
-	s = strings.ReplaceAll(s,
-		"Main branch (you will usually use this for PRs)",
-		"Default branch (you will usually use this for PRs)")
-	return s
 }
 
 // forceMaxThinking pins reasoning_effort to "high" for Hunyuan-family models

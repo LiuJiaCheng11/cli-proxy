@@ -63,8 +63,6 @@ import "C"
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -76,14 +74,16 @@ import (
 	"unicode"
 	"unsafe"
 
+	"github.com/LiuJiaCheng11/cli-proxy/internal/channelgate"
+	"github.com/LiuJiaCheng11/cli-proxy/internal/wire"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 const (
-	providerName  = "workbuddy-intl"
-	authFileName  = "workbuddy-intl.json"
-	upstreamBase  = "https://www.workbuddy.ai"
+	providerName = "workbuddy-intl"
+	authFileName = "workbuddy-intl.json"
+	upstreamBase = "https://www.workbuddy.ai"
 	// Outbound client identity, aligned with the official 5.8.4 desktop build.
 	// Upstream runs a *sampled* channel verification on the chat endpoint: when
 	// it samples a request, it demands the conversation header family (see
@@ -531,37 +531,6 @@ func commonHeaders(req *http.Request) {
 	req.Header.Set("X-IDE-Version", clientVersion)
 }
 
-// newHexID returns 32 lowercase hex chars, the shape the official client uses
-// for X-Request-ID and the request/message trace ids.
-func newHexID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand is effectively infallible here; fall back to time so a
-		// transient failure still yields a well-formed, unique-enough id.
-		n := uint64(time.Now().UnixNano())
-		for i := 0; i < 8; i++ {
-			b[i] = byte(n >> (8 * i))
-		}
-	}
-	return hex.EncodeToString(b[:])
-}
-
-// newUUID returns a dashed (8-4-4-4-12) UUIDv4, matching the conversation id
-// shape captured from the official 5.8.4 desktop client.
-func newUUID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		n := uint64(time.Now().UnixNano())
-		for i := 0; i < 8; i++ {
-			b[i] = byte(n >> (8 * i))
-		}
-	}
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
-	h := hex.EncodeToString(b[:])
-	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
-}
-
 // applyConversationHeaders adds the conversation header family that upstream's
 // sampled channel verification requires on /v2/chat/completions.
 //
@@ -577,18 +546,25 @@ func newUUID() string {
 // the request / conversation-request / root-request / message ids are one and
 // the same 32-hex value.
 func applyConversationHeaders(req *http.Request) {
-	reqID := newHexID()
-	req.Header.Set("X-Request-ID", reqID)
-	req.Header.Set("X-Conversation-ID", newUUID())
-	req.Header.Set("X-Conversation-Request-ID", reqID)
-	req.Header.Set("X-Root-Request-ID", reqID)
-	req.Header.Set("X-Conversation-Message-ID", reqID)
+	wire.ApplyConversationHeaders(req)
+}
+
+// identityOf describes the outbound client this credential should present.
+func identityOf(sa *storedAuth) wire.Identity {
+	return wire.Identity{
+		Region:     wire.RegionGlobal,
+		UID:        sa.Account.UID,
+		AppVersion: clientVersion,
+	}
 }
 
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 func backendHeaders(req *http.Request, sa *storedAuth) {
 	commonHeaders(req)
+	identity := identityOf(sa)
+	wire.ApplyAttributionHeaders(req, identity)
+	wire.ApplyDeviceHeaders(req, identity)
 	applyConversationHeaders(req)
 	if sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
@@ -613,7 +589,6 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
-	req.Header.Set("X-Product", "SaaS")
 }
 
 // doJSON sends method to fullURL with the given headers, parses the {code,msg,data}
@@ -885,6 +860,129 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 // Executor handlers
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Request preparation and the channel-gate retry ladder
+// -----------------------------------------------------------------------------
+
+// prepareBody turns the host's payload into the shape the gateway accepts and
+// neutralises the content fingerprints it refuses.
+//
+// The order is load-bearing. PrepareBody fixes the STRUCTURE (stream flag,
+// developer role, system head, tool_choice) — a request with the wrong shape is
+// refused before its content is ever read. RewritePhrasesInBody then applies the
+// measured phrase table, which is the fix for a real DeepSeek Harness prompt:
+// measured 2026-11-02, the same body with every other field held fixed answers
+// 400 / 11128 until the WHOLE table is applied, and any single row is not enough.
+func prepareBody(payload, original []byte) []byte {
+	src := payload
+	if len(src) == 0 {
+		src = original
+	}
+	prepared := channelgate.PrepareBody(src)
+	rewritten, _ := channelgate.RewritePhrasesInBody(prepared)
+	return applyModelTweaks(rewritten)
+}
+
+// gateLadder is the rescue ladder for a request the gateway refused with code
+// 11128 after the phrase table had already been applied.
+//
+// It does NOT try to guess the offending span — it makes the request structurally
+// different instead, in increasing order of cost:
+//
+//  1. force a neutral head in front of every scanned message;
+//  2. insert zero-width breaks at sentence/clause/proper-name boundaries;
+//  3. the same, between every pair of word runes (the dense form).
+//
+// Each rung is only spent if the previous one was refused, because the ladder is
+// a last resort: rung 3 grows a 10.8k-character prompt by ~70%.
+type gateRung struct {
+	label string
+	apply func([]byte) ([]byte, bool)
+}
+
+func gateLadder() []gateRung {
+	return []gateRung{
+		{"neutral head", channelgate.NeutralizeFingerprints},
+		{"sparse zero-width", func(b []byte) ([]byte, bool) { return channelgate.PerturbFingerprints(b, false) }},
+		{"dense zero-width", func(b []byte) ([]byte, bool) { return channelgate.PerturbFingerprints(b, true) }},
+	}
+}
+
+// chatResult is one upstream answer: either a live 2xx response (the caller owns
+// the body) or the failure status and body text.
+type chatResult struct {
+	resp   *http.Response
+	status int
+	body   []byte
+	// tried lists the rescue rungs that were spent before giving up, so a
+	// refusal that survives the whole ladder can be told apart from one that was
+	// never retried.
+	tried []string
+}
+
+// describe renders a failure for the client. The ladder history is appended
+// because "upstream 400: 11128" alone cannot distinguish a request that was
+// retried three times from one that was not retried at all.
+func (r chatResult) describe() string {
+	message := fmt.Sprintf("upstream %d: %s", r.status, truncate(string(r.body), 400))
+	if len(r.tried) > 0 {
+		message += fmt.Sprintf(" [channel-gate ladder exhausted: %s]", strings.Join(r.tried, " -> "))
+	}
+	return message
+}
+
+// postChat sends one chat request and returns the raw answer without consuming
+// the body of a successful response.
+func postChat(body []byte, sa *storedAuth) (chatResult, error) {
+	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	if err != nil {
+		return chatResult{}, err
+	}
+	backendHeaders(httpReq, sa)
+	resp, err := sharedHTTPClient().Do(httpReq)
+	if err != nil {
+		return chatResult{}, fmt.Errorf("http_error: %w", err)
+	}
+	if resp.StatusCode < 400 {
+		return chatResult{resp: resp, status: resp.StatusCode}, nil
+	}
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
+	return chatResult{status: resp.StatusCode, body: payload}, nil
+}
+
+// openChatStream posts a prepared body and walks the rescue ladder while the
+// gateway keeps answering 11128. On success it returns a live response whose
+// body the caller must close; otherwise it returns the last failure.
+func openChatStream(body []byte, sa *storedAuth) (chatResult, error) {
+	result, err := postChat(body, sa)
+	if err != nil {
+		return result, err
+	}
+	if result.resp != nil || !channelgate.IsChannelReject(result.body) {
+		return result, nil
+	}
+	current := body
+	var tried []string
+	for _, rung := range gateLadder() {
+		next, changed := rung.apply(current)
+		if !changed {
+			continue
+		}
+		current = next
+		tried = append(tried, rung.label)
+		result, err = postChat(current, sa)
+		if err != nil {
+			return result, err
+		}
+		if result.resp != nil || !channelgate.IsChannelReject(result.body) {
+			return result, nil
+		}
+	}
+	result.tried = tried
+	return result, nil
+}
+
 func handleExecExecute(raw []byte) ([]byte, error) {
 	var req pluginapi.ExecutorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -896,22 +994,16 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	}
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
-	body := rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest))
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	body := prepareBody(req.Payload, req.OriginalRequest)
+	result, err := openChatStream(body, sa)
 	if err != nil {
 		return nil, err
 	}
-	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http_error: %w", err)
+	if result.resp == nil {
+		return nil, fmt.Errorf("%s", result.describe())
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		payload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(payload), 200))
-	}
-	completion, err := aggregateCompletion(resp.Body, req.Model)
+	defer result.resp.Body.Close()
+	completion, err := aggregateCompletion(result.resp.Body, req.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -935,34 +1027,43 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	body := req.Payload
-	if len(body) == 0 {
-		body = req.OriginalRequest
-	}
-	body = rewriteSystemForUpstream(body)
+	body := prepareBody(req.Payload, req.OriginalRequest)
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
 
-	// No async stream id → fall back to synchronous chunk collection.
-	if req.StreamID == "" {
-		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
-		if errCollect != nil {
-			return nil, errCollect
-		}
-		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
-	}
-
-	// Async: return immediately with empty chunks. A goroutine pumps the upstream
-	// and emits each chunk via host.stream.emit so the client sees true streaming.
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	// The FIRST attempt is deliberately synchronous: the channel gate answers
+	// 400 with a body, and a retry cannot be decided after the client has
+	// already been handed a stream id.
+	result, err := openChatStream(body, sa)
 	if err != nil {
+		if req.StreamID == "" {
+			return nil, err
+		}
 		streamEmitError(req.StreamID, err.Error())
 		streamClose(req.StreamID)
 		return okEnvelope(streamResponse{Headers: headers})
 	}
-	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+	if result.resp == nil {
+		message := result.describe()
+		if req.StreamID == "" {
+			return nil, fmt.Errorf("%s", message)
+		}
+		streamEmitError(req.StreamID, message)
+		streamClose(req.StreamID)
+		return okEnvelope(streamResponse{Headers: headers})
+	}
+
+	// No async stream id → drain the response and return the chunks inline.
+	if req.StreamID == "" {
+		defer result.resp.Body.Close()
+		return okEnvelope(streamResponse{Headers: headers, Chunks: aggregateSSE(result.resp.Body, sseFramed)})
+	}
+
+	// Async: return immediately with empty chunks. A goroutine reads the already
+	// open response and emits each chunk via host.stream.emit so the client sees
+	// true streaming.
+	go pumpUpstreamStream(result.resp, req.StreamID, sseFramed)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -974,24 +1075,12 @@ func streamHeaders() http.Header {
 	return h
 }
 
-// pumpUpstreamStream reads the upstream SSE response in the background and
-// emits each cleaned chunk to the host stream. It closes the stream when done.
-// An emit failure (client disconnected → host closed the stream) aborts the
-// pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
-	resp, err := sharedHTTPClient().Do(httpReq)
-	if err != nil {
-		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-		streamClose(streamID)
-		return
-	}
+// pumpUpstreamStream reads an already-open upstream SSE response in the
+// background and emits each cleaned chunk to the host stream. It closes the
+// stream when done. An emit failure (client disconnected → host closed the
+// stream) aborts the pump so we stop reading a dead upstream.
+func pumpUpstreamStream(resp *http.Response, streamID string, sseFramed bool) {
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
-		streamClose(streamID)
-		return
-	}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -1011,26 +1100,6 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) 
 		}
 	}
 	streamClose(streamID)
-}
-
-// collectUpstreamStream is the synchronous fallback (no async stream id): drain
-// the upstream, clean each chunk, return them as a slice.
-func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http_error: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
-	}
-	return aggregateSSE(resp.Body, sseFramed), nil
 }
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
@@ -1119,32 +1188,14 @@ func isEmptyValue(v any) bool {
 	return false
 }
 
-// forceStreamBody returns the request body with "stream":true set, since the
-// upstream rejects non-streaming chat requests.
-func forceStreamBody(payload, original []byte) []byte {
-	src := payload
-	if len(src) == 0 {
-		src = original
-	}
-	var obj map[string]any
-	if json.Unmarshal(src, &obj) != nil {
-		return src
-	}
-	obj["stream"] = true
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return src
-	}
-	return out
-}
-
-// rewriteSystemForUpstream neutralizes Claude Code template phrases that
-// Tencent CodeBuddy's content filter blocklists verbatim — the agent identity
-// line ("You are Claude Code, Anthropic's official CLI for Claude.") and the
-// git injection ("Main branch (you will usually use this for PRs)"). Each
-// rewrite is a single-word change so the prompt's meaning is preserved while
-// dodging the exact-match filter.
-func rewriteSystemForUpstream(payload []byte) []byte {
+// applyModelTweaks pins reasoning_effort to "high" for Hunyuan-family models
+// (hy3 / hy4) so they always reason at maximum depth. CodeBuddy only honors
+// "high" for deep thinking (medium/low/max/xhigh/ultra all fall back to no
+// reasoning), so we override whatever the client sent.
+//
+// Kept out of channelgate on purpose: this is a MODEL preference, not a gateway
+// rule, and the two must be able to change independently.
+func applyModelTweaks(payload []byte) []byte {
 	if len(payload) == 0 {
 		return payload
 	}
@@ -1152,24 +1203,7 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 	if json.Unmarshal(payload, &obj) != nil {
 		return payload
 	}
-	messages, _ := obj["messages"].([]any)
-	changed := false
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		if rewriteContentField(msg) {
-			changed = true
-		}
-	}
-	if ensureSystemFirst(obj) {
-		changed = true
-	}
-	if forceMaxThinking(obj) {
-		changed = true
-	}
-	if !changed {
+	if !forceMaxThinking(obj) {
 		return payload
 	}
 	out, err := json.Marshal(obj)
@@ -1179,101 +1213,7 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 	return out
 }
 
-// rewriteContentField sanitizes blocked templates in one message's content,
-// handling both plain-string and OpenAI multimodal (array of parts) shapes.
-// Returns true if the message was modified.
-func rewriteContentField(msg map[string]any) bool {
-	switch c := msg["content"].(type) {
-	case string:
-		if r := sanitizeBlockedTemplates(c); r != c {
-			msg["content"] = r
-			return true
-		}
-	case []any:
-		modified := false
-		for _, p := range c {
-			part, ok := p.(map[string]any)
-			if !ok {
-				continue
-			}
-			if t, ok := part["text"].(string); ok {
-				if r := sanitizeBlockedTemplates(t); r != t {
-					part["text"] = r
-					modified = true
-				}
-			}
-		}
-		return modified
-	}
-	return false
-}
-
-func sanitizeBlockedTemplates(s string) string {
-	s = strings.ReplaceAll(s,
-		"You are Claude Code, Anthropic's official CLI for Claude.",
-		"You are Claude Code, Anthropic's official CLI tool for Claude.")
-	s = strings.ReplaceAll(s,
-		"Main branch (you will usually use this for PRs)",
-		"Default branch (you will usually use this for PRs)")
-	return s
-}
-
-// ensureSystemFirst guarantees messages[0] is a system message. The workbuddy.ai
-// gateway enforces this: a conversation that opens with anything else is
-// rejected with HTTP 400 / code 11128 ("first message is not system prompt"),
-// which the client renders as a security-policy block. Its domestic sibling
-// (copilot.tencent.com) has no such check, which is why the same client works
-// against workbuddy and fails against workbuddy-intl.
-//
-// Clients that send no system prompt at all — Cherry Studio with an empty
-// assistant prompt, raw OpenAI SDK calls — would otherwise never get a
-// completion. A system message already present further down the list is hoisted
-// to the front so the client's own prompt is preserved; only when the
-// conversation carries none do we prepend defaultSystemPrompt.
-// Returns true if the message list was modified.
-func ensureSystemFirst(obj map[string]any) bool {
-	messages, ok := obj["messages"].([]any)
-	if !ok || len(messages) == 0 {
-		return false
-	}
-	if messageRole(messages[0]) == "system" {
-		return false
-	}
-	for i, m := range messages[1:] {
-		if messageRole(m) != "system" {
-			continue
-		}
-		// Three-index slice caps the capacity so append cannot write into the
-		// caller's backing array; the hoist gets a fresh slice either way.
-		hoisted, rest := messages[i+1], append(messages[:i+1:i+1], messages[i+2:]...)
-		obj["messages"] = append([]any{hoisted}, rest...)
-		return true
-	}
-	obj["messages"] = append([]any{map[string]any{"role": "system", "content": defaultSystemPrompt}}, messages...)
-	return true
-}
-
-// defaultSystemPrompt is the system message injected when the client sent none.
-// It cannot be empty or whitespace: kimi-k3 / kimi-k2.6 / kimi-k2.8-preview /
-// balanced-model answer 400 code 11151 ("a message has empty content") to a
-// zero-length or blank system message, while every other model in the catalog
-// accepts it. A short benign sentence is the only shape verified to pass on all
-// of them. Requests that already carry their own system message never see it.
-const defaultSystemPrompt = "You are a helpful assistant."
-
-func messageRole(m any) string {
-	msg, ok := m.(map[string]any)
-	if !ok {
-		return ""
-	}
-	role, _ := msg["role"].(string)
-	return role
-}
-
-// forceMaxThinking pins reasoning_effort to "high" for Hunyuan-family models
-// (hy3 / hy4) so they always reason at maximum depth. CodeBuddy only honors
-// "high" for deep thinking (medium/low/max/xhigh/ultra all fall back to no
-// reasoning), so we override whatever the client sent. Returns true if changed.
+// forceMaxThinking reports whether the body was changed.
 func forceMaxThinking(obj map[string]any) bool {
 	model, _ := obj["model"].(string)
 	if !strings.HasPrefix(model, "hy3") && !strings.HasPrefix(model, "hy4") {

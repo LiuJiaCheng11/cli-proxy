@@ -65,6 +65,41 @@ curl http://localhost:8317/v1/chat/completions \
 
 流式 / 非流式都支持;非流式请求会被内部转成流式再聚合(CodeBuddy 上游 `code 11101` 拒绝非流式)。
 
+## 渠道校验(11128)
+
+上游对 chat 请求跑一次「渠道校验」:命中即回 HTTP 400 / 业务码 `11128`,提示语是「这次调用没通过渠道校验,可能不是官方客户端发出的」——**这句话是误导,失败原因在提示词内容里,不在头上**。
+
+2026-11-02 用一份真实的 DeepSeek Harness system prompt(5,923 字)逐项实测,其余字段全部固定:
+
+| 发出去的 prompt | 结果 |
+|---|---|
+| 原样 | 400 / 11128 |
+| 只改三句身份句 | 400 / 11128 |
+| 只改 `@` 路径段落 | 400 / 11128 |
+| 只在最前面加一句中性开场 | 400 / 11128 |
+| 只插零宽字符 | 400 / 11128 |
+| **整张改写表全上** | **200** |
+
+所以闸门同时匹配多段文本,任何单一变换都不够。插件因此每次请求都跑完整张表(`internal/channelgate` 的 `gatePhrases`),并保留一条三级兜底阶梯,只在上游仍然回 11128 时逐级花掉:
+
+1. 在每个被扫描的 message 前加强制中性开场;
+2. 在句号/逗号/专有名词边界插零宽空格;
+3. 同上,但词与词之间全插(最贵,10.8k 字的 prompt 会涨约 70%)。
+
+被扫描的 role 是 `system` 和 `assistant`;`user` / `tool` 不动——改用户自己的话只会改变对话,换不来任何闸门收益。
+
+除内容外还有两条形状要求,插件都会满足:`messages[0]` 必须是 `system`(缺了就补 `You are a helpful assistant.`,空串会被 kimi 系回 `11151`),以及 `developer` role 会被改写成 `system`。
+
+属于 cat-and-mouse:上游哪天加新指纹,得跟着改 `gatePhrases`;兜底阶梯负责那些还没被测出来的。
+
+## 出站身份
+
+上游按「这条请求像不像官方客户端」做风控,插件因此对齐官方的三族头:
+
+- **会话三元组**:`X-Conversation-ID`(每次新 UUID)+ `X-Conversation-Request-ID` / `X-Root-Request-ID` / `X-Conversation-Message-ID`(同一个 32 hex 值)。缺了它,国际版被抽样时会回 11128「conversation id missing」——这正是「某个账号忽然不能用了」的真身。
+- **归属头**:`X-Agent-Purpose` / `X-IDE-Name` / `X-IDE-Type` / `X-Product` 同值 `WorkBuddy`,外加 `X-CodeBuddy-Request` 与按区域切的 `Accept-Language`。官方客户端不会一个头说自己是 WorkBuddy、另一个头说自己是 CLI。
+- **设备对**:`X-Machine-ID` / `X-Session-ID`,按账号 uid 派生(`internal/wire`),两个账号在同一台机器上也不会看起来是同一台设备;uid 只做哈希,不上线。
+
 ## Claude Code 兼容性
 
 腾讯 CodeBuddy 的内容审核把 Claude Code 的两句固定 system 模板逐字加进了黑名单,命中即回"敏感内容"拒答:
@@ -72,9 +107,7 @@ curl http://localhost:8317/v1/chat/completions \
 - `You are Claude Code, Anthropic's official CLI for Claude.`(身份句)
 - `Main branch (you will usually use this for PRs)`(git 注入句)
 
-任何一字改动都绕过(精确匹配,非语义审核)。workbuddy 转发前会自动把这两句做最小改写(`CLI`→`CLI tool`、`Main branch`→`Default branch`),语义不变,Claude Code 照常工作。
-
-属于 cat-and-mouse:腾讯哪天多加模板句,得跟着改 `sanitizeBlockedTemplates`。
+任何一字改动都绕过(精确匹配,非语义审核)。这两句的改写现在是 `internal/channelgate` 里 `claudeCodePhrases` 的一部分,和上面那张表一起在每次请求上跑。
 
 ## 思考模式
 

@@ -25,7 +25,7 @@ identifier, _ := h.callAuthProviderIdentifier(record.id, authProvider)
 if identifier == provider { return &record }
 ```
 
-`auth.identifier` 只能返回一个字符串，硬合会坏掉 OAuth 登录路由、`auth.refresh` 路由和模型注册。所以是"一个仓库，三个构建目标"。
+`auth.identifier` 只能返回一个字符串，硬合会坏掉 OAuth 登录路由、`auth.refresh` 路由和模型注册。所以是"一个仓库，四个构建目标"。
 
 ## 前置条件
 
@@ -165,8 +165,11 @@ CPA 默认端口 `8317`，API key 在 `config.yaml` 的 `api-keys`。
 
 ```
 cli-proxy/
-├── go.mod                 三个 provider 共用一个模块
+├── go.mod                 四个 provider 共用一个模块
 ├── go.sum
+├── internal/
+│   ├── channelgate/       两家上游共用的「渠道校验」绕过逻辑（11128）
+│   └── wire/              出站身份：会话三元组、归属头、设备对
 ├── qoder/
 │   ├── main.go            C ABI、RPC 分发
 │   ├── cosy.go            自定义 base64、RSA/AES、COSY 签名
@@ -186,6 +189,14 @@ cli-proxy/
 └── workbuddy-intl/
     ├── main.go           同一份逻辑，换国际版上游
     └── README.md
+```
+
+`internal/` 下的两个包是 workbuddy / workbuddy-intl 共用的：`channelgate` 负责过「渠道校验」（`code 11128`），`wire` 负责让出站请求长得像官方客户端。两家的上游校验规则不同，但这两块是同一份实测结论，改一处两边一起生效。
+
+## 测试
+
+```bash
+go test ./internal/...    # 渠道闸门与出站身份的单元测试，不需要 CGO
 ```
 
 ## 安全

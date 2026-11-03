@@ -113,9 +113,34 @@ curl http://localhost:8317/v1/chat/completions \
 - `You are Claude Code, Anthropic's official CLI for Claude.`（身份句）
 - `Main branch (you will usually use this for PRs)`（git 注入句）
 
-命中回 `Illegal API invocation from an unapproved channel`。**精确匹配，非语义审核**：任何一字改动都绕过。插件转发前做最小改写（`CLI` → `CLI tool`、`Main branch` → `Default branch`），语义不变，Claude Code 照常工作。
+命中回 `Illegal API invocation from an unapproved channel`。**精确匹配，非语义审核**：任何一字改动都绕过。这两句的改写现在是 `internal/channelgate` 里 `claudeCodePhrases` 的一部分。
 
-属于 cat-and-mouse：腾讯哪天多加模板句，得跟着改 `sanitizeBlockedTemplates`。
+### 3.5 内容指纹（`code 11128`，2026-11-02 实测）
+
+同一个码还负责「prompt 里有我们不想认的东西」。用一份真实的 DeepSeek Harness system prompt（5,923 字）逐项实测，其余字段全部固定：
+
+| 发出去的 prompt | 结果 |
+|---|---|
+| 原样 | 400 / 11128 |
+| 只改三句身份句 | 400 / 11128 |
+| 只改 `@` 路径段落 | 400 / 11128 |
+| 只在最前面加一句中性开场 | 400 / 11128 |
+| 只插零宽字符 | 400 / 11128 |
+| **整张改写表全上** | **200** |
+
+闸门同时匹配多段文本，任何单一变换都不够。插件因此每次请求都跑完整张表（`gatePhrases`），并保留三级兜底阶梯，只在上游仍然回 11128 时逐级花掉：强制中性开场 → 句读/专有名词边界零宽 → 词间全插零宽。失败时错误信息会写明阶梯花到哪一级（`[channel-gate ladder exhausted: ...]`），便于区分「重试过三次」和「根本没重试」。
+
+被扫描的 role 是 `system` 和 `assistant`；`user` / `tool` 不动——改用户自己的话只会改变对话，换不来任何闸门收益。
+
+### 3.6 出站身份
+
+国际版被抽样时还会查「这条请求像不像官方客户端」：
+
+- **会话三元组**：`X-Conversation-ID`（每次新 UUID）+ `X-Conversation-Request-ID` / `X-Root-Request-ID` / `X-Conversation-Message-ID`（同一个 32 hex 值）。缺了它回 11128「conversation id missing」，而且只在抽样时回——所以表现为「某个账号忽然不能用了」。
+- **归属头**：`X-Agent-Purpose` / `X-IDE-Name` / `X-IDE-Type` / `X-Product` 同值 `WorkBuddy`，外加 `X-CodeBuddy-Request` 与按区域切的 `Accept-Language`。
+- **设备对**：`X-Machine-ID` / `X-Session-ID`，按账号 uid 派生（`internal/wire`），两个账号在同一台机器上也不会看起来是同一台设备；uid 只做哈希，不上线。
+
+属于 cat-and-mouse：上游哪天加新指纹，得跟着改 `gatePhrases`；兜底阶梯负责那些还没被测出来的。
 
 ### 4. 模型名校验比国内版严格
 
